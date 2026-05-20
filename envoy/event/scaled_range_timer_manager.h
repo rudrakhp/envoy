@@ -45,6 +45,12 @@ public:
    * max.
    */
   virtual void setScaleFactor(UnitFloat scale_factor) PURE;
+
+  /**
+   * Sets the scale factor for timers of a specific type. This overrides the global scale factor
+   * for timers of that type. Timers of types with no per-type scale factor use the global value.
+   */
+  virtual void setScaleFactor(ScaledTimerType timer_type, UnitFloat scale_factor) PURE;
 };
 
 using ScaledRangeTimerManagerPtr = std::unique_ptr<ScaledRangeTimerManager>;

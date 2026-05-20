@@ -1349,6 +1349,120 @@ TEST_F(OverloadManagerLoadShedPointImplTest, LoadShedPointShouldUseCurrentReadin
   EXPECT_EQ(overload_action_states[0], UnitFloat(1));
 }
 
+// Config where each timer has its own trigger resource.
+constexpr char kReducedTimeoutsPerTimerTriggersConfig[] = R"YAML(
+  refresh_interval:
+    seconds: 1
+  resource_monitors:
+    - name: envoy.resource_monitors.fake_resource1
+      typed_config:
+        "@type": type.googleapis.com/google.protobuf.Struct
+    - name: envoy.resource_monitors.fake_resource2
+      typed_config:
+        "@type": type.googleapis.com/google.protobuf.Timestamp
+  actions:
+    - name: envoy.overload_actions.reduce_timeouts
+      typed_config:
+        "@type": type.googleapis.com/envoy.config.overload.v3.ScaleTimersOverloadActionConfig
+        timer_scale_factors:
+          - timer: HTTP_DOWNSTREAM_CONNECTION_IDLE
+            min_timeout: 2s
+            triggers:
+              - name: "envoy.resource_monitors.fake_resource1"
+                scaled:
+                  scaling_threshold: 0.5
+                  saturation_threshold: 1.0
+          - timer: HTTP_DOWNSTREAM_CONNECTION_MAX
+            min_scale: { value: 20 }
+            triggers:
+              - name: "envoy.resource_monitors.fake_resource2"
+                scaled:
+                  scaling_threshold: 0.6
+                  saturation_threshold: 1.0
+      triggers:
+        - name: "envoy.resource_monitors.fake_resource1"
+          scaled:
+            scaling_threshold: 0.5
+            saturation_threshold: 1.0
+  )YAML";
+
+TEST_F(OverloadManagerImplTest, PerTimerTriggersTimerMinimumsMap) {
+  auto manager(createOverloadManager(kReducedTimeoutsPerTimerTriggersConfig));
+
+  auto* mock_scaled_timer_manager = new Event::MockScaledRangeTimerManager();
+  Event::ScaledTimerTypeMapConstSharedPtr timer_minimums;
+  EXPECT_CALL(*manager, createScaledRangeTimerManager)
+      .WillOnce(
+          DoAll(SaveArg<1>(&timer_minimums),
+                Return(ByMove(Event::ScaledRangeTimerManagerPtr{mock_scaled_timer_manager}))));
+
+  Event::MockDispatcher mock_dispatcher;
+  auto scaled_timer_manager = manager->scaledTimerFactory()(mock_dispatcher);
+
+  constexpr std::pair<TimerType, Event::ScaledTimerMinimum> expected_minimums[]{
+      {TimerType::HttpDownstreamIdleConnectionTimeout,
+       Event::AbsoluteMinimum(std::chrono::seconds(2))},
+      {TimerType::HttpDownstreamMaxConnectionTimeout, Event::ScaledMinimum(UnitFloat(0.2))},
+  };
+  EXPECT_THAT(timer_minimums, Pointee(UnorderedElementsAreArray(expected_minimums)));
+}
+
+TEST_F(OverloadManagerImplTest, PerTimerTriggersAdjustPerTypeScaleFactor) {
+  setDispatcherExpectation();
+  auto manager(createOverloadManager(kReducedTimeoutsPerTimerTriggersConfig));
+
+  auto* mock_scaled_timer_manager = new Event::MockScaledRangeTimerManager();
+  EXPECT_CALL(*manager, createScaledRangeTimerManager)
+      .WillOnce(Return(ByMove(Event::ScaledRangeTimerManagerPtr{mock_scaled_timer_manager})));
+
+  Event::MockDispatcher mock_dispatcher;
+  EXPECT_CALL(mock_dispatcher, post).WillRepeatedly([](Event::PostCb cb) { cb(); });
+
+  auto scaled_timer_manager = manager->scaledTimerFactory()(mock_dispatcher);
+  manager->start();
+
+  // factory1 pressure 0.6 triggers HTTP_DOWNSTREAM_CONNECTION_IDLE (range [0.5,1.0], value=0.2).
+  // The per-type scale factor is 1 - 0.2 = 0.8. The global action also fires.
+  EXPECT_CALL(*mock_scaled_timer_manager,
+              setScaleFactor(TimerType::HttpDownstreamIdleConnectionTimeout,
+                             Property(&UnitFloat::value, FloatNear(0.8, 0.00001))));
+  EXPECT_CALL(*mock_scaled_timer_manager,
+              setScaleFactor(Property(&UnitFloat::value, FloatNear(0.8, 0.00001))));
+  factory1_.monitor_->setPressure(0.6);
+  timer_cb_();
+}
+
+TEST_F(OverloadManagerImplTest, PerTimerTriggersUnknownResourceFails) {
+  const std::string config = R"YAML(
+    refresh_interval:
+      seconds: 1
+    resource_monitors:
+      - name: envoy.resource_monitors.fake_resource1
+        typed_config:
+          "@type": type.googleapis.com/google.protobuf.Struct
+    actions:
+      - name: envoy.overload_actions.reduce_timeouts
+        typed_config:
+          "@type": type.googleapis.com/envoy.config.overload.v3.ScaleTimersOverloadActionConfig
+          timer_scale_factors:
+            - timer: HTTP_DOWNSTREAM_CONNECTION_IDLE
+              min_timeout: 2s
+              triggers:
+                - name: "envoy.resource_monitors.nonexistent_resource"
+                  scaled:
+                    scaling_threshold: 0.5
+                    saturation_threshold: 1.0
+        triggers:
+          - name: "envoy.resource_monitors.fake_resource1"
+            scaled:
+              scaling_threshold: 0.5
+              saturation_threshold: 1.0
+    )YAML";
+
+  EXPECT_THROW_WITH_REGEX(createOverloadManager(config), EnvoyException,
+                          "Unknown trigger resource.*nonexistent_resource.*");
+}
+
 } // namespace
 } // namespace Server
 } // namespace Envoy

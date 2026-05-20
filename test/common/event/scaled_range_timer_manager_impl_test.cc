@@ -679,32 +679,43 @@ TEST_F(ScaledRangeTimerManagerTest, MultipleTimersWithChangeInScalingFactor) {
 }
 
 TEST_F(ScaledRangeTimerManagerTest, LooksUpConfiguredMinimums) {
-  // Test-only class that overrides one of the createScaledTimer overloads to show that the other
-  // one calls into this one after looking up the minimum.
-  class TestScaledRangeTimerManager : public ScaledRangeTimerManagerImpl {
-  public:
-    using ScaledRangeTimerManagerImpl::createTimer;
-    using ScaledRangeTimerManagerImpl::ScaledRangeTimerManagerImpl;
-    TimerPtr createTimer(ScaledTimerMinimum minimum, TimerCb callback) override {
-      return createScaledTimer(minimum, callback);
-    }
-    MOCK_METHOD(TimerPtr, createScaledTimer, (ScaledTimerMinimum, TimerCb));
-  };
-
+  // Verify that createTimer(ScaledTimerType, ...) uses the minimum configured for that type.
+  // With min_scale=0.5 and scale_factor=0, the timer fires at 0.5*max (the minimum).
   const ScaledTimerTypeMap timer_types{
-      {ScaledTimerType::UnscaledRealTimerForTest, ScaledMinimum(UnitFloat::max())},
-      {ScaledTimerType::HttpDownstreamIdleConnectionTimeout, ScaledMinimum(UnitFloat(0.3))},
-      {ScaledTimerType::HttpDownstreamMaxConnectionTimeout, ScaledMinimum(UnitFloat(0.4))},
-      {ScaledTimerType::HttpDownstreamIdleStreamTimeout, ScaledMinimum(UnitFloat(0.6))},
+      {ScaledTimerType::HttpDownstreamIdleConnectionTimeout, ScaledMinimum(UnitFloat(0.5))},
   };
 
-  TestScaledRangeTimerManager manager(dispatcher_,
-                                      std::make_unique<decltype(timer_types)>(timer_types));
-  for (const auto& [timer_type, minimum] : timer_types) {
-    SCOPED_TRACE(static_cast<int>(timer_type));
-    EXPECT_CALL(manager, createScaledTimer(minimum, _));
-    manager.createTimer(timer_type, []() {});
-  }
+  ScaledRangeTimerManagerImpl manager(dispatcher_,
+                                      std::make_shared<ScaledTimerTypeMap>(timer_types));
+  manager.setScaleFactor(UnitFloat(0.0));
+
+  bool fired = false;
+  auto timer = manager.createTimer(ScaledTimerType::HttpDownstreamIdleConnectionTimeout,
+                                   [&fired]() { fired = true; });
+  // Enable with 10s max: min is 5s, scale_factor=0 so fires at min (5s).
+  timer->enableTimer(std::chrono::seconds(10));
+
+  // 4s elapsed — not yet at the 5s minimum.
+  simTime().advanceTimeAndRun(std::chrono::seconds(4), dispatcher_, Dispatcher::RunType::NonBlock);
+  EXPECT_FALSE(fired);
+
+  // Another 2s (total 6s) — past the minimum, timer should have fired.
+  simTime().advanceTimeAndRun(std::chrono::seconds(2), dispatcher_, Dispatcher::RunType::Block);
+  EXPECT_TRUE(fired);
+}
+
+TEST_F(ScaledRangeTimerManagerTest, UsesMaxScaleForUnconfiguredTimerType) {
+  // A timer type not in the map defaults to ScaledMinimum(UnitFloat::max()), so min == max.
+  ScaledRangeTimerManagerImpl manager(dispatcher_, std::make_shared<ScaledTimerTypeMap>());
+  manager.setScaleFactor(UnitFloat(1.0));
+
+  bool fired = false;
+  auto timer = manager.createTimer(ScaledTimerType::HttpDownstreamIdleConnectionTimeout,
+                                   [&fired]() { fired = true; });
+  timer->enableTimer(std::chrono::seconds(5));
+
+  simTime().advanceTimeAndRun(std::chrono::seconds(5), dispatcher_, Dispatcher::RunType::Block);
+  EXPECT_TRUE(fired);
 }
 
 } // namespace

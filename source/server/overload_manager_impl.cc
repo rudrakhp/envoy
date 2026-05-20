@@ -148,14 +148,20 @@ absl::StatusOr<Event::ScaledTimerType> parseTimerType(
   }
 }
 
-absl::StatusOr<Event::ScaledTimerTypeMap>
+struct ParsedTimerConfig {
+  Event::ScaledTimerTypeMap timer_map;
+  absl::flat_hash_map<Event::ScaledTimerType, std::vector<envoy::config::overload::v3::Trigger>>
+      per_timer_triggers;
+};
+
+absl::StatusOr<ParsedTimerConfig>
 parseTimerMinimums(const Protobuf::Any& typed_config,
                    ProtobufMessage::ValidationVisitor& validation_visitor) {
   using Config = envoy::config::overload::v3::ScaleTimersOverloadActionConfig;
   const Config action_config =
       MessageUtil::anyConvertAndValidate<Config>(typed_config, validation_visitor);
 
-  Event::ScaledTimerTypeMap timer_map;
+  ParsedTimerConfig result;
 
   for (const auto& scale_timer : action_config.timer_scale_factors()) {
     auto timer_or_error = parseTimerType(scale_timer.timer());
@@ -169,15 +175,21 @@ parseTimerMinimums(const Protobuf::Any& typed_config,
             : Event::ScaledTimerMinimum(
                   Event::ScaledMinimum(UnitFloat(scale_timer.min_scale().value() / 100.0)));
 
-    auto [_, inserted] = timer_map.insert(std::make_pair(timer_type, minimum));
+    auto [_, inserted] = result.timer_map.insert(std::make_pair(timer_type, minimum));
     UNREFERENCED_PARAMETER(_);
     if (!inserted) {
       return absl::InvalidArgumentError(fmt::format("Found duplicate entry for timer type {}",
                                                     Config::TimerType_Name(scale_timer.timer())));
     }
+
+    if (!scale_timer.triggers().empty()) {
+      std::vector<envoy::config::overload::v3::Trigger> triggers(scale_timer.triggers().begin(),
+                                                                 scale_timer.triggers().end());
+      result.per_timer_triggers.emplace(timer_type, std::move(triggers));
+    }
   }
 
-  return timer_map;
+  return result;
 }
 
 } // namespace
@@ -508,7 +520,40 @@ OverloadManagerImpl::OverloadManagerImpl(Event::Dispatcher& dispatcher, Stats::S
       auto timer_or_error = parseTimerMinimums(action.typed_config(), validation_visitor);
       SET_AND_RETURN_IF_NOT_OK(timer_or_error.status(), creation_status);
       timer_minimums_ =
-          std::make_shared<const Event::ScaledTimerTypeMap>(std::move(*timer_or_error));
+          std::make_shared<const Event::ScaledTimerTypeMap>(std::move(timer_or_error->timer_map));
+
+      // For each timer that has its own triggers, create an internal OverloadAction and wire
+      // its triggers into resource_to_actions_.
+      for (auto& [timer_type, trigger_configs] : timer_or_error->per_timer_triggers) {
+        // Synthetic internal action name — not user-visible, never registered for callbacks.
+        const std::string per_timer_action_name =
+            absl::StrCat(name, ".timer.", static_cast<int>(timer_type));
+        const auto per_timer_symbol = action_symbol_table_.get(per_timer_action_name);
+
+        envoy::config::overload::v3::OverloadAction per_timer_proto;
+        per_timer_proto.set_name(per_timer_action_name);
+        for (const auto& trig : trigger_configs) {
+          const std::string& resource = trig.name();
+          const auto proactive_resource_it =
+              OverloadProactiveResources::get().proactive_action_name_to_resource_.find(resource);
+          if (resources_.find(resource) == resources_.end() &&
+              proactive_resource_it ==
+                  OverloadProactiveResources::get().proactive_action_name_to_resource_.end()) {
+            creation_status = absl::InvalidArgumentError(
+                fmt::format("Unknown trigger resource {} for reduce_timeouts timer {}", resource,
+                            per_timer_action_name));
+            return;
+          }
+          *per_timer_proto.add_triggers() = trig;
+          resource_to_actions_.insert(std::make_pair(resource, per_timer_symbol));
+        }
+
+        auto per_timer_action_or_error = OverloadAction::create(per_timer_proto, stats_scope);
+        SET_AND_RETURN_IF_NOT_OK(per_timer_action_or_error.status(), creation_status);
+
+        actions_.try_emplace(per_timer_symbol, std::move(*per_timer_action_or_error));
+        per_timer_action_symbols_.emplace(timer_type, per_timer_symbol);
+      }
     } else if (name == OverloadActionNames::get().ResetStreams) {
       if (!config.has_buffer_factory_config()) {
         creation_status = absl::InvalidArgumentError(
@@ -645,14 +690,26 @@ ThreadLocalOverloadState& OverloadManagerImpl::getThreadLocalOverloadState() { r
 Event::ScaledRangeTimerManagerFactory OverloadManagerImpl::scaledTimerFactory() {
   return [this](Event::Dispatcher& dispatcher) {
     auto manager = createScaledRangeTimerManager(dispatcher, timer_minimums_);
+
     registerForAction(OverloadActionNames::get().ReduceTimeouts, dispatcher,
                       [manager = manager.get()](OverloadActionState scale_state) {
-                        manager->setScaleFactor(
-                            // The action state is 0 for no overload up to 1 for maximal overload,
-                            // but the scale factor for timers is 1 for no scaling and 0 for maximal
-                            // scaling, so invert the value to pass in (1-value).
-                            scale_state.value().invert());
+                        // Action state is 0 for no overload up to 1 for maximal overload; invert
+                        // so scale factor is 1 (no scaling) when idle and 0 (max scaling) when
+                        // saturated.
+                        manager->setScaleFactor(scale_state.value().invert());
                       });
+
+    // For each timer with per-timer triggers, register a callback that sets only that timer's
+    // scale factor, overriding the global value for that type.
+    for (const auto& [timer_type, per_timer_symbol] : per_timer_action_symbols_) {
+      const auto action_name = action_symbol_table_.name(per_timer_symbol);
+      registerForAction(
+          std::string(action_name), dispatcher,
+          [manager = manager.get(), timer_type = timer_type](OverloadActionState scale_state) {
+            manager->setScaleFactor(timer_type, scale_state.value().invert());
+          });
+    }
+
     return manager;
   };
 }

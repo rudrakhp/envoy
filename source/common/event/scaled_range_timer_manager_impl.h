@@ -8,6 +8,7 @@
 #include "envoy/event/timer.h"
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Event {
@@ -32,11 +33,13 @@ public:
   TimerPtr createTimer(ScaledTimerMinimum minimum, TimerCb callback) override;
   TimerPtr createTimer(ScaledTimerType timer_type, TimerCb callback) override;
   void setScaleFactor(UnitFloat scale_factor) override;
+  void setScaleFactor(ScaledTimerType timer_type, UnitFloat scale_factor) override;
 
 private:
   class RangeTimerImpl;
 
-  // A queue object that maintains a list of timers with the same (max - min) values.
+  // A queue object that maintains a list of timers with the same (max - min) values and the same
+  // timer type (or no type for timers created with an explicit ScaledTimerMinimum).
   struct Queue {
     struct Item {
       Item(RangeTimerImpl& timer, MonotonicTime active_time);
@@ -49,8 +52,11 @@ private:
     // Typedef for convenience.
     using Iterator = std::list<Item>::iterator;
 
-    Queue(std::chrono::milliseconds duration, ScaledRangeTimerManagerImpl& manager,
-          Dispatcher& dispatcher);
+    Queue(absl::optional<ScaledTimerType> timer_type, std::chrono::milliseconds duration,
+          ScaledRangeTimerManagerImpl& manager, Dispatcher& dispatcher);
+
+    // The optional timer type for all timers in this queue.
+    const absl::optional<ScaledTimerType> timer_type_;
 
     // The (max - min) value for all timers in range_timers_.
     const std::chrono::milliseconds duration_;
@@ -83,27 +89,39 @@ private:
     Queue::Iterator iterator_;
   };
 
+  // Key used for heterogeneous lookup in the queue set.
+  struct QueueKey {
+    absl::optional<ScaledTimerType> timer_type;
+    std::chrono::milliseconds duration;
+  };
+
   struct Hash {
     // Magic declaration to allow heterogeneous lookup.
     using is_transparent = void; // NOLINT(readability-identifier-naming)
 
-    size_t operator()(const std::chrono::milliseconds duration) const {
-      return hash_(duration.count());
+    size_t operator()(const QueueKey& key) const {
+      size_t h = duration_hash_(key.duration.count());
+      if (key.timer_type.has_value()) {
+        h ^= std::hash<int>{}(static_cast<int>(*key.timer_type)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      }
+      return h;
     }
-    size_t operator()(const Queue& queue) const { return (*this)(queue.duration_); }
+    size_t operator()(const Queue& queue) const {
+      return (*this)(QueueKey{queue.timer_type_, queue.duration_});
+    }
     size_t operator()(const std::unique_ptr<Queue>& queue) const { return (*this)(*queue); }
-    std::hash<std::chrono::milliseconds::rep> hash_;
+    std::hash<std::chrono::milliseconds::rep> duration_hash_;
   };
 
   struct Eq {
     // Magic declaration to allow heterogeneous lookup.
     using is_transparent = void; // NOLINT(readability-identifier-naming)
 
-    bool operator()(const std::unique_ptr<Queue>& lhs, std::chrono::milliseconds rhs) const {
-      return lhs->duration_ == rhs;
+    bool operator()(const std::unique_ptr<Queue>& lhs, const QueueKey& rhs) const {
+      return lhs->duration_ == rhs.duration && lhs->timer_type_ == rhs.timer_type;
     }
     bool operator()(const std::unique_ptr<Queue>& lhs, const Queue& rhs) const {
-      return (*this)(lhs, rhs.duration_);
+      return (*this)(lhs, QueueKey{rhs.timer_type_, rhs.duration_});
     }
     bool operator()(const std::unique_ptr<Queue>& lhs, const std::unique_ptr<Queue>& rhs) const {
       return (*this)(lhs, *rhs);
@@ -114,7 +132,10 @@ private:
                                           std::chrono::milliseconds duration,
                                           UnitFloat scale_factor);
 
-  ScalingTimerHandle activateTimer(std::chrono::milliseconds duration, RangeTimerImpl& timer);
+  UnitFloat effectiveScaleFactor(absl::optional<ScaledTimerType> timer_type) const;
+
+  ScalingTimerHandle activateTimer(absl::optional<ScaledTimerType> timer_type,
+                                   std::chrono::milliseconds duration, RangeTimerImpl& timer);
 
   void removeTimer(ScalingTimerHandle handle);
 
@@ -125,6 +146,7 @@ private:
   Dispatcher& dispatcher_;
   const ScaledTimerTypeMapConstSharedPtr timer_minimums_;
   UnitFloat scale_factor_;
+  absl::flat_hash_map<ScaledTimerType, UnitFloat> per_type_scale_factors_;
   absl::flat_hash_set<std::unique_ptr<Queue>, Hash, Eq> queues_;
 };
 

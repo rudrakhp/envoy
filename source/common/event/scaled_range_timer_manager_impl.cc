@@ -32,8 +32,10 @@ namespace Event {
  */
 class ScaledRangeTimerManagerImpl::RangeTimerImpl final : public Timer {
 public:
-  RangeTimerImpl(ScaledTimerMinimum minimum, TimerCb callback, ScaledRangeTimerManagerImpl& manager)
-      : minimum_(minimum), manager_(manager), callback_(std::move(callback)),
+  RangeTimerImpl(ScaledTimerMinimum minimum, absl::optional<ScaledTimerType> timer_type,
+                 TimerCb callback, ScaledRangeTimerManagerImpl& manager)
+      : minimum_(minimum), timer_type_(timer_type), manager_(manager),
+        callback_(std::move(callback)),
         min_duration_timer_(manager.dispatcher_.createTimer([this] { onMinTimerComplete(); })) {}
 
   ~RangeTimerImpl() override { disableTimer(); }
@@ -61,7 +63,7 @@ public:
     if (min_ms <= std::chrono::milliseconds::zero()) {
       // If the duration spread (max - min) is zero, skip over the waiting-for-min and straight to
       // the scaling-max state.
-      auto handle = manager_.activateTimer(max_ms, *this);
+      auto handle = manager_.activateTimer(timer_type_, max_ms, *this);
       state_.emplace<ScalingMax>(handle);
     } else {
       state_.emplace<WaitingForMin>(max_ms - min_ms);
@@ -120,15 +122,16 @@ private:
     ASSERT(absl::holds_alternative<WaitingForMin>(state_));
     const WaitingForMin& waiting = absl::get<WaitingForMin>(state_);
 
-    // This
     if (waiting.scalable_duration_ < std::chrono::milliseconds::zero()) {
       trigger();
     } else {
-      state_.emplace<ScalingMax>(manager_.activateTimer(waiting.scalable_duration_, *this));
+      state_.emplace<ScalingMax>(
+          manager_.activateTimer(timer_type_, waiting.scalable_duration_, *this));
     }
   }
 
   const ScaledTimerMinimum minimum_;
+  const absl::optional<ScaledTimerType> timer_type_;
   ScaledRangeTimerManagerImpl& manager_;
   const TimerCb callback_;
   const TimerPtr min_duration_timer_;
@@ -156,28 +159,53 @@ TimerPtr ScaledRangeTimerManagerImpl::createTimer(ScaledTimerType timer_type, Ti
       minimum_it != timer_minimums_->end()
           ? minimum_it->second
           : Event::ScaledTimerMinimum(Event::ScaledMinimum(UnitFloat::max()));
-  return createTimer(minimum, std::move(callback));
+  return std::make_unique<RangeTimerImpl>(minimum, timer_type, std::move(callback), *this);
 }
 
 TimerPtr ScaledRangeTimerManagerImpl::createTimer(ScaledTimerMinimum minimum, TimerCb callback) {
-  return std::make_unique<RangeTimerImpl>(minimum, callback, *this);
+  return std::make_unique<RangeTimerImpl>(minimum, absl::nullopt, std::move(callback), *this);
 }
 
 void ScaledRangeTimerManagerImpl::setScaleFactor(UnitFloat scale_factor) {
   const MonotonicTime now = dispatcher_.approximateMonotonicTime();
   scale_factor_ = scale_factor;
   for (auto& queue : queues_) {
-    resetQueueTimer(*queue, now);
+    if (!queue->timer_type_.has_value()) {
+      resetQueueTimer(*queue, now);
+    }
   }
+}
+
+void ScaledRangeTimerManagerImpl::setScaleFactor(ScaledTimerType timer_type,
+                                                 UnitFloat scale_factor) {
+  const MonotonicTime now = dispatcher_.approximateMonotonicTime();
+  per_type_scale_factors_.insert_or_assign(timer_type, scale_factor);
+  for (auto& queue : queues_) {
+    if (queue->timer_type_ == timer_type) {
+      resetQueueTimer(*queue, now);
+    }
+  }
+}
+
+UnitFloat ScaledRangeTimerManagerImpl::effectiveScaleFactor(
+    absl::optional<ScaledTimerType> timer_type) const {
+  if (timer_type.has_value()) {
+    const auto it = per_type_scale_factors_.find(*timer_type);
+    if (it != per_type_scale_factors_.end()) {
+      return it->second;
+    }
+  }
+  return scale_factor_;
 }
 
 ScaledRangeTimerManagerImpl::Queue::Item::Item(RangeTimerImpl& timer, MonotonicTime active_time)
     : timer_(timer), active_time_(active_time) {}
 
-ScaledRangeTimerManagerImpl::Queue::Queue(std::chrono::milliseconds duration,
+ScaledRangeTimerManagerImpl::Queue::Queue(absl::optional<ScaledTimerType> timer_type,
+                                          std::chrono::milliseconds duration,
                                           ScaledRangeTimerManagerImpl& manager,
                                           Dispatcher& dispatcher)
-    : duration_(duration),
+    : timer_type_(timer_type), duration_(duration),
       timer_(dispatcher.createTimer([this, &manager] { manager.onQueueTimerFired(*this); })) {}
 
 ScaledRangeTimerManagerImpl::ScalingTimerHandle::ScalingTimerHandle(Queue& queue,
@@ -192,16 +220,17 @@ MonotonicTime ScaledRangeTimerManagerImpl::computeTriggerTime(const Queue::Item&
 }
 
 ScaledRangeTimerManagerImpl::ScalingTimerHandle
-ScaledRangeTimerManagerImpl::activateTimer(std::chrono::milliseconds duration,
+ScaledRangeTimerManagerImpl::activateTimer(absl::optional<ScaledTimerType> timer_type,
+                                           std::chrono::milliseconds duration,
                                            RangeTimerImpl& range_timer) {
   // Ensure this is being called on the same dispatcher.
   ASSERT(dispatcher_.isThreadSafe());
 
-  // Find the matching queue for the (max - min) duration of the range timer; if there isn't one,
-  // create it.
-  auto it = queues_.find(duration);
+  // Find the matching queue for the (timer_type, max - min) pair; if there isn't one, create it.
+  const QueueKey key{timer_type, duration};
+  auto it = queues_.find(key);
   if (it == queues_.end()) {
-    auto queue = std::make_unique<Queue>(duration, *this, dispatcher_);
+    auto queue = std::make_unique<Queue>(timer_type, duration, *this, dispatcher_);
     it = queues_.emplace(std::move(queue)).first;
   }
   Queue& queue = **it;
@@ -242,8 +271,8 @@ void ScaledRangeTimerManagerImpl::removeTimer(ScalingTimerHandle handle) {
 
 void ScaledRangeTimerManagerImpl::resetQueueTimer(Queue& queue, MonotonicTime now) {
   ASSERT(!queue.range_timers_.empty());
-  const MonotonicTime trigger_time =
-      computeTriggerTime(queue.range_timers_.front(), queue.duration_, scale_factor_);
+  const MonotonicTime trigger_time = computeTriggerTime(
+      queue.range_timers_.front(), queue.duration_, effectiveScaleFactor(queue.timer_type_));
   if (trigger_time < now) {
     queue.timer_->enableTimer(std::chrono::milliseconds::zero());
   } else {
@@ -260,8 +289,8 @@ void ScaledRangeTimerManagerImpl::onQueueTimerFired(Queue& queue) {
   // Pop and trigger timers until the one at the front isn't supposed to have expired yet (given the
   // current scale factor).
   queue.processing_timers_ = true;
-  while (!timers.empty() &&
-         computeTriggerTime(timers.front(), queue.duration_, scale_factor_) <= now) {
+  const UnitFloat sf = effectiveScaleFactor(queue.timer_type_);
+  while (!timers.empty() && computeTriggerTime(timers.front(), queue.duration_, sf) <= now) {
     auto item = std::move(queue.range_timers_.front());
     queue.range_timers_.pop_front();
     item.timer_.trigger();

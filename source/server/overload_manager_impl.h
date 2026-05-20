@@ -244,6 +244,9 @@ private:
 
   Event::ScaledTimerTypeMapConstSharedPtr timer_minimums_;
 
+  absl::flat_hash_map<Event::ScaledTimerType, NamedOverloadActionSymbolTable::Symbol>
+      per_timer_action_symbols_;
+
   absl::flat_hash_map<NamedOverloadActionSymbolTable::Symbol, OverloadActionState>
       state_updates_to_flush_;
   absl::flat_hash_map<ActionCallback*, OverloadActionState> callbacks_to_flush_;
